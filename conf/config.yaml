@@ -1,0 +1,25 @@
+data:
+  m: 16  # number of items
+  n: 100  # number of data
+  p: 5  # size of feature
+  deg: 6  # polynomial degree
+  dim: 2  # dimension of knapsack
+  noise_width: 0.5  # noise half-width
+  caps_per_dim: 20  # capacity per dimension
+  test_size: 1000
+  random_state: 246
+
+model:
+  hidden_sizes: [32, 128, 512, 2048]
+
+optimizer:
+  solver_eps_abs: 1e-4
+  solver_eps_rel: 1e-4
+  solver_verbose: false
+
+training:
+  learning_rate: 0.001
+  batch_size: 100
+  n_epochs: 10
+  random_seed: 42
+  eval_every_n_batches: 10  # Evaluate every N minibatches
