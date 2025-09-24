@@ -25,6 +25,10 @@ def create_batch_optimizer(A, b, G, h, optimizer_config):
     """Create a batched optimization function."""
 
     def single_optimize(c_vector):
+        """
+        Returns the solution and optimal objective value for a single LP,
+        MAXIMIZING c^T x
+        """
         lp = create_lp(-c_vector, A, b, G, h, 0, 1)
         solver = r2HPDHG(
             eps_abs=optimizer_config.solver_eps_abs,
@@ -42,8 +46,8 @@ def create_spo_loss(batch_optimize):
     """Create SPO+ loss function with custom gradients."""
 
     def spo_fun(pred_cost, true_cost, true_sol, true_obj):
-        sol, obj = batch_optimize(2 * pred_cost - true_cost)
-        loss = -obj + 2 * jnp.sum(pred_cost * true_sol, axis=1) - true_obj
+        sol, obj = batch_optimize(true_cost - 2 * pred_cost)
+        loss = obj + 2 * jnp.sum(pred_cost * true_sol, axis=1) - true_obj
         loss = jnp.mean(loss)
         return loss, sol
 
@@ -138,7 +142,7 @@ def create_val_epoch(model, batch_optimize, loss_fn):
         pred_c = model.apply(params, x_data)
         loss = loss_fn(pred_c, c_data, true_sols_data, true_objs_data)
         pred_sol, pred_obj = batch_optimize(pred_c)
-        subopt = jnp.mean(jnp.sum(pred_sol * c_data, axis=1), axis=0) / jnp.sum(
+        subopt = 1 - jnp.mean(jnp.sum(pred_sol * c_data, axis=1), axis=0) / jnp.sum(
             true_objs_data
         )
         return {
@@ -302,7 +306,7 @@ def main(cfg: DictConfig) -> None:
             )
             epoch_time = time.time() - start_time
             train_metrics["train/epoch_time"] = epoch_time
-            print("Training took {epoch_time:.2f}s")
+            print(f"Training took {epoch_time:.2f}s")
 
             # Evaluate after training on this chunk
             start_time = time.time()
