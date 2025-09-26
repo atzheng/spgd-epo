@@ -12,6 +12,7 @@ from flax.struct import dataclass
 import wandb
 import time
 from pprint import pprint
+from jax_tqdm import scan_tqdm
 
 
 @dataclass
@@ -29,7 +30,7 @@ def create_batch_optimizer(A, b, G, h, optimizer_config):
         Returns the solution and optimal objective value for a single LP,
         MAXIMIZING c^T x
         """
-        lp = create_lp(-c_vector, A, b, G, h, 0, 1)
+        lp = create_lp(c_vector, A, b, G, h, 0, 1)
         solver = r2HPDHG(
             eps_abs=optimizer_config.solver_eps_abs,
             eps_rel=optimizer_config.solver_eps_rel,
@@ -43,11 +44,11 @@ def create_batch_optimizer(A, b, G, h, optimizer_config):
 
 
 def create_spo_loss(batch_optimize):
-    """Create SPO+ loss function with custom gradients."""
+    """Create SPO+ loss function, for maximization, with custom gradients."""
 
     def spo_fun(pred_cost, true_cost, true_sol, true_obj):
-        sol, obj = batch_optimize(true_cost - 2 * pred_cost)
-        loss = obj + 2 * jnp.sum(pred_cost * true_sol, axis=1) - true_obj
+        sol, obj = batch_optimize(2 * pred_cost - true_cost)
+        loss = -obj + 2 * jnp.sum(pred_cost * true_sol, axis=1) - true_obj
         loss = jnp.mean(loss)
         return loss, sol
 
@@ -81,7 +82,7 @@ def create_loss_fn(model, spo_loss):
     return loss_fn
 
 
-def create_train_epoch(optimizer, loss_fn):
+def create_train_epoch(optimizer, loss_fn, length):
     """Create function to train on batch data using scan."""
 
     def train_step(
@@ -95,7 +96,7 @@ def create_train_epoch(optimizer, loss_fn):
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss
 
-    def train_epoch(state: TrainingState, batch_data, length: int):
+    def train_epoch(state: TrainingState, batch_data):
         """Train on batch data using scan."""
 
         def scan_fn(carry, _):
@@ -142,12 +143,17 @@ def create_val_epoch(model, batch_optimize, loss_fn):
         pred_c = model.apply(params, x_data)
         loss = loss_fn(pred_c, c_data, true_sols_data, true_objs_data)
         pred_sol, pred_obj = batch_optimize(pred_c)
-        subopt = 1 - jnp.mean(jnp.sum(pred_sol * c_data, axis=1), axis=0) / jnp.sum(
-            true_objs_data
-        )
+        true_objs_pred = jnp.mean(jnp.sum(pred_sol * c_data, axis=1), axis=0)
+        subopt = 1 - true_objs_pred / jnp.mean(true_objs_data)
         return {
             "loss": loss,
             "subopt": subopt,
+            "pred_obj": pred_obj.mean(),
+            "true_obj": true_objs_pred,
+            "l2_err_c": jnp.mean(jnp.sum((pred_c - c_data) ** 2, axis=1)),
+            "l2_err_soln": jnp.mean(
+                jnp.sum((pred_sol - true_sols_data) ** 2, axis=1)
+            ),
         }
 
     def val_epoch(
@@ -169,6 +175,7 @@ def create_val_epoch(model, batch_optimize, loss_fn):
             true_sols_train_all,
             true_objs_train_all,
         )
+
         val_loss = val_step(
             params, x_test, c_test, true_sols_test, true_objs_test
         )
@@ -217,6 +224,8 @@ def main(cfg: DictConfig) -> None:
         noise_width=config.data.noise_width,
     )
 
+    c = -c  # pyepo generates costs for minimization; we want maximization
+
     # Data split
     x_train, x_test, c_train, c_test = list(
         map(
@@ -264,7 +273,9 @@ def main(cfg: DictConfig) -> None:
     true_sols_test, true_objs_test = batch_optimize(c_test)
     loss_fn = create_loss_fn(model, spo_loss)
 
-    train_epoch = create_train_epoch(optimizer, loss_fn)
+    train_epoch = jax.jit(
+        create_train_epoch(optimizer, loss_fn, config.training.batches_per_eval)
+    )
     val_epoch = jax.jit(create_val_epoch(model, batch_optimize, spo_loss))
 
     # Training loop
@@ -286,6 +297,7 @@ def main(cfg: DictConfig) -> None:
         true_objs_train,
     )
 
+    global_step = 0
     for epoch in range(config.training.n_epochs):
         # Shuffle training data
         perm = jax.random.permutation(jax.random.PRNGKey(epoch), n_train)
@@ -299,12 +311,12 @@ def main(cfg: DictConfig) -> None:
             ),
             data,
         )
-        for batch_idx in range(num_evals_per_epoch):
+        for eval_idx in range(num_evals_per_epoch):
             start_time = time.time()
-            training_state, train_metrics = train_epoch(
-                training_state, batches, cfg.training.batches_per_eval
-            )
+            training_state, train_metrics = train_epoch(training_state, batches)
+            jax.block_until_ready(training_state)
             epoch_time = time.time() - start_time
+            print(train_epoch._cache_size())
             train_metrics["train/epoch_time"] = epoch_time
             print(f"Training took {epoch_time:.2f}s")
 
@@ -321,11 +333,12 @@ def main(cfg: DictConfig) -> None:
                 true_sols_test,
                 true_objs_test,
             )
+            jax.block_until_ready(val_metrics)
             val_time = time.time() - start_time
             val_metrics["epoch_time"] = val_time
             print(f"Validation took {val_time:.2f}s")
 
-            global_step = epoch * batches_per_epoch + batch_idx
+            global_step += cfg.training.batches_per_eval
             wandb.log(
                 {"train/" + k: v for k, v in train_metrics.items()},
                 step=global_step,

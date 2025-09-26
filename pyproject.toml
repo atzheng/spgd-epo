@@ -10,6 +10,8 @@ python = "^3.11"
 mpax = "^0.2.4"
 pyepo = "^1.0.2"
 scikit-learn = "^1.7.2"
+wandb = "^0.22.0"
+jax-tqdm = "^0.4.0"
 
 
 [build-system]
