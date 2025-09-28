@@ -1,0 +1,9 @@
+m: 10000  # number of items
+n: 4000 # number of data
+p: 5  # size of feature
+deg: 6  # polynomial degree
+dim: 10  # dimension of knapsack
+noise_width: 0.5  # noise half-width
+caps_per_dim: 500 # capacity per dimension
+test_size: 1000
+random_state: 246
