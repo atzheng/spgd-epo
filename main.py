@@ -13,6 +13,7 @@ import wandb
 import time
 from pprint import pprint
 from jax_tqdm import scan_tqdm
+from jax.experimental import io_callback
 
 
 @dataclass
@@ -297,10 +298,22 @@ def main(cfg: DictConfig) -> None:
         true_objs_train,
     )
 
-    global_step = 0
-    for epoch in range(config.training.n_epochs):
+
+    start_time = time.time()
+    # Create logging callbacks
+    def log_metrics_callback(metrics, step):
+        print(f"** {time.time() - start_time} seconds **")
+        """Host callback for logging metrics to wandb."""
+        wandb.log(metrics, step=int(step))
+        pprint(metrics)
+        return None
+
+    def train_eval_step(carry, epoch_idx):
+        """Single epoch with evaluation step for scan."""
+        training_state, global_step = carry
+        
         # Shuffle training data
-        perm = jax.random.permutation(jax.random.PRNGKey(epoch), n_train)
+        perm = jax.random.permutation(jax.random.PRNGKey(epoch_idx), n_train)
         batches = jax.tree.map(
             lambda data: data[perm].reshape(
                 (
@@ -311,19 +324,17 @@ def main(cfg: DictConfig) -> None:
             ),
             data,
         )
-        for eval_idx in range(num_evals_per_epoch):
-            start_time = time.time()
-            training_state, train_metrics = train_epoch(training_state, batches)
-            jax.block_until_ready(training_state)
-            epoch_time = time.time() - start_time
-            print(train_epoch._cache_size())
-            train_metrics["train/epoch_time"] = epoch_time
-            print(f"Training took {epoch_time:.2f}s")
-
-            # Evaluate after training on this chunk
-            start_time = time.time()
+        
+        def eval_step(carry, eval_idx):
+            """Single evaluation step within an epoch."""
+            ts, gs = carry
+            
+            # Training
+            ts, train_metrics = train_epoch(ts, batches)
+            
+            # Validation
             val_metrics = val_epoch(
-                training_state.params,
+                ts.params,
                 x_train,
                 c_train,
                 true_sols_train,
@@ -333,22 +344,33 @@ def main(cfg: DictConfig) -> None:
                 true_sols_test,
                 true_objs_test,
             )
-            jax.block_until_ready(val_metrics)
-            val_time = time.time() - start_time
-            val_metrics["epoch_time"] = val_time
-            print(f"Validation took {val_time:.2f}s")
-
-            global_step += cfg.training.batches_per_eval
-            wandb.log(
-                {"train/" + k: v for k, v in train_metrics.items()},
-                step=global_step,
+            
+            # Log all metrics
+            all_metrics = {
+                **{"train/" + k: v for k, v in train_metrics.items()},
+                **{"val/" + k: v for k, v in val_metrics.items()}
+            }
+            
+            new_gs = gs + cfg.training.batches_per_eval
+            io_callback(
+                log_metrics_callback, None, all_metrics, new_gs
             )
-            wandb.log(
-                {"val/" + k: v for k, v in val_metrics.items()},
-                step=global_step,
-            )
-            pprint(val_metrics)
-
+            
+            return (ts, new_gs), None
+        
+        # Run all evaluations for this epoch
+        (final_ts, final_gs), _ = jax.lax.scan(
+            eval_step, (training_state, global_step), jnp.arange(num_evals_per_epoch)
+        )
+        
+        return (final_ts, final_gs), None
+    
+    # Run all epochs using scan
+    initial_carry = (training_state, 0)
+    (final_training_state, final_global_step), _ = jax.lax.scan(
+        train_eval_step, initial_carry, jnp.arange(config.training.n_epochs)
+    )
+    jax.block_until_ready(final_training_state)
     print("Training completed!")
 
     # Finish wandb run
