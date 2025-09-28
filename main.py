@@ -49,27 +49,34 @@ def load_cached_solutions(data_hash):
     cache_path = get_cache_path(data_hash)
     if os.path.exists(cache_path):
         try:
-            with open(cache_path, 'rb') as f:
+            with open(cache_path, "rb") as f:
                 cached_data = pickle.load(f)
                 print(f"Loaded cached solutions from {cache_path}")
-                return cached_data['train_sols'], cached_data['train_objs'], cached_data['test_sols'], cached_data['test_objs']
+                return (
+                    cached_data["train_sols"],
+                    cached_data["train_objs"],
+                    cached_data["test_sols"],
+                    cached_data["test_objs"],
+                )
         except Exception as e:
             print(f"Error loading cache: {e}")
             return None
     return None
 
 
-def save_cached_solutions(data_hash, train_sols, train_objs, test_sols, test_objs):
+def save_cached_solutions(
+    data_hash, train_sols, train_objs, test_sols, test_objs
+):
     """Save optimal solutions to cache."""
     cache_path = get_cache_path(data_hash)
     try:
         cached_data = {
-            'train_sols': train_sols,
-            'train_objs': train_objs, 
-            'test_sols': test_sols,
-            'test_objs': test_objs
+            "train_sols": train_sols,
+            "train_objs": train_objs,
+            "test_sols": test_sols,
+            "test_objs": test_objs,
         }
-        with open(cache_path, 'wb') as f:
+        with open(cache_path, "wb") as f:
             pickle.dump(cached_data, f)
         print(f"Saved solutions to cache: {cache_path}")
     except Exception as e:
@@ -323,19 +330,30 @@ def main(cfg: DictConfig) -> None:
     # Precompute true solutions and objectives for training and validation data with caching
     data_hash = create_data_hash([c_train, c_test, G, h])
     print(f"Data hash: {data_hash}")
-    
+
     # Try to load cached solutions
     cached_solutions = load_cached_solutions(data_hash)
     if cached_solutions is not None:
-        true_sols_train, true_objs_train, true_sols_test, true_objs_test = cached_solutions
+        (
+            true_sols_train,
+            true_objs_train,
+            true_sols_test,
+            true_objs_test,
+        ) = cached_solutions
     else:
         print("Computing true solutions for training data...")
         true_sols_train, true_objs_train = batch_optimize(c_train)
         print("Computing true solutions for validation data...")
         true_sols_test, true_objs_test = batch_optimize(c_test)
-        
+
         # Save to cache
-        save_cached_solutions(data_hash, true_sols_train, true_objs_train, true_sols_test, true_objs_test)
+        save_cached_solutions(
+            data_hash,
+            true_sols_train,
+            true_objs_train,
+            true_sols_test,
+            true_objs_test,
+        )
     loss_fn = create_loss_fn(model, spo_loss)
 
     train_epoch = jax.jit(
@@ -362,8 +380,8 @@ def main(cfg: DictConfig) -> None:
         true_objs_train,
     )
 
-
     start_time = time.time()
+
     # Create logging callbacks
     def log_metrics_callback(metrics, step):
         print(f"** {time.time() - start_time} seconds **")
@@ -375,7 +393,7 @@ def main(cfg: DictConfig) -> None:
     def train_eval_step(carry, epoch_idx):
         """Single epoch with evaluation step for scan."""
         training_state, global_step = carry
-        
+
         # Shuffle training data
         perm = jax.random.permutation(jax.random.PRNGKey(epoch_idx), n_train)
         batches = jax.tree.map(
@@ -388,14 +406,14 @@ def main(cfg: DictConfig) -> None:
             ),
             data,
         )
-        
+
         def eval_step(carry, eval_idx):
             """Single evaluation step within an epoch."""
             ts, gs = carry
-            
+
             # Training
             ts, train_metrics = train_epoch(ts, batches)
-            
+
             # Validation
             val_metrics = val_epoch(
                 ts.params,
@@ -408,27 +426,27 @@ def main(cfg: DictConfig) -> None:
                 true_sols_test,
                 true_objs_test,
             )
-            
+
             # Log all metrics
             all_metrics = {
                 **{"train/" + k: v for k, v in train_metrics.items()},
-                **{"val/" + k: v for k, v in val_metrics.items()}
+                **{"val/" + k: v for k, v in val_metrics.items()},
             }
-            
+
             new_gs = gs + cfg.training.batches_per_eval
-            io_callback(
-                log_metrics_callback, None, all_metrics, new_gs
-            )
-            
+            io_callback(log_metrics_callback, None, all_metrics, new_gs)
+
             return (ts, new_gs), None
-        
+
         # Run all evaluations for this epoch
         (final_ts, final_gs), _ = jax.lax.scan(
-            eval_step, (training_state, global_step), jnp.arange(num_evals_per_epoch)
+            eval_step,
+            (training_state, global_step),
+            jnp.arange(num_evals_per_epoch),
         )
-        
+
         return (final_ts, final_gs), None
-    
+
     # Run all epochs using scan
     initial_carry = (training_state, 0)
     (final_training_state, final_global_step), _ = jax.lax.scan(
