@@ -1,12 +1,12 @@
 data:
-  m: 16  # number of items
-  n: 30  # number of data
+  m: 16 # number of items
+  n: 100  # number of data
   p: 5  # size of feature
   deg: 6  # polynomial degree
-  dim: 2  # dimension of knapsack
+  dim: 2 # dimension of knapsack
   noise_width: 0.5  # noise half-width
-  caps_per_dim: 20  # capacity per dimension
-  test_size: 30
+  caps_per_dim: 20 # capacity per dimension
+  test_size: 100
   random_state: 246
 
 model:
@@ -18,10 +18,14 @@ optimizer:
   solver_verbose: false
 
 training:
-  learning_rate: 0.001
+  learning_rate: 0.0001
   batch_size: 10
-  n_epochs: 10
+  n_epochs: 100
   random_seed: 42
   algo: sequential
   batches_per_eval: 2
   batches_per_epoch: null
+  picard:
+    window_size: 6
+    restart_rule: best
+    fill_rule: last

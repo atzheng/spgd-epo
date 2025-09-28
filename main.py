@@ -18,6 +18,7 @@ import hashlib
 import pickle
 import os
 import tempfile
+from typing import Tuple
 
 
 @dataclass
@@ -25,6 +26,14 @@ class TrainingState:
     params: dict
     opt_state: dict
     data_index: int = 0
+
+
+@dataclass
+class BatchData:
+    x: jnp.ndarray
+    c: jnp.ndarray
+    true_sols: jnp.ndarray
+    true_objs: jnp.ndarray
 
 
 def create_data_hash(data_arrays):
@@ -134,64 +143,100 @@ def create_spo_loss(batch_optimize):
 def create_loss_fn(model, spo_loss):
     """Create loss function for SPO+ training."""
 
-    def loss_fn(params, x_batch, c_batch, true_sols_batch, true_objs_batch):
+    def loss_fn(params, batch_data: BatchData):
         """Compute SPO+ loss for a batch."""
-        pred_c = model.apply(params, x_batch)
-        loss = spo_loss(pred_c, c_batch, true_sols_batch, true_objs_batch)
+        pred_c = model.apply(params, batch_data.x)
+        loss = spo_loss(
+            pred_c, batch_data.c, batch_data.true_sols, batch_data.true_objs
+        )
         return loss
 
     return loss_fn
 
 
-def create_train_epoch(optimizer, loss_fn, length):
+def create_train_epoch(optimizer, loss_fn, length, window_size):
     """Create function to train on batch data using scan."""
 
-    def train_step(
-        params, opt_state, x_batch, c_batch, true_sols_batch, true_objs_batch
-    ):
-        """Single training step."""
+    def picard_mapper(training_state: TrainingState, batch_data: BatchData):
         loss, grads = jax.value_and_grad(loss_fn)(
-            params, x_batch, c_batch, true_sols_batch, true_objs_batch
+            training_state.params, batch_data
         )
-        updates, opt_state = optimizer.update(grads, opt_state)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, loss
+        return grads
 
-    def train_epoch(state: TrainingState, batch_data):
+    def picard_reducer(
+        training_state: TrainingState, grad
+    ) -> Tuple[TrainingState, TrainingState]:
+        updates, opt_state = optimizer.update(grad, training_state.opt_state)
+        params = optax.apply_updates(training_state.params, updates)
+        new_state = TrainingState(
+            params=params,
+            opt_state=opt_state,
+            data_index=training_state.data_index + 1,
+        )
+        return new_state, new_state
+
+    def picard_iteration(_, state_and_data: Tuple[TrainingState, BatchData]):
+        training_state, batch_data = state_and_data
+        grads = jax.vmap(picard_mapper, in_axes=(0, 0))(
+            training_state, jax.tree.map(lambda x: x[:window_size], batch_data)
+        )
+        init_state = jax.tree.map(
+            lambda x: x[0],
+            training_state,
+        )
+        new_training_state = jax.lax.scan(picard_reducer, init_state, grads)[1]
+        new_batch_data = jax.tree.map(
+            lambda x: jnp.roll(x, 1, axis=0), batch_data
+        )
+        return new_training_state, new_batch_data
+
+    def train_epoch(training_state: TrainingState, batch_data: BatchData):
         """Train on batch data using scan."""
+        final_state, final_batch = jax.lax.fori_loop(
+            0, length, picard_iteration, (training_state, batch_data)
+        )
+        return final_state
 
-        def scan_fn(carry, _):
-            training_state = carry
-            data_idx = jnp.mod(state.data_index, batch_data[0].shape[0])
-            x_batch, c_batch, true_sols_batch, true_objs_batch = jax.tree.map(
-                lambda x: x[data_idx],
-                batch_data,
-            )
+    # def train_step(training_state, batch_data: BatchData):
+    #     """Single training step."""
+    #     loss, grads = jax.value_and_grad(loss_fn)(
+    #         training_state.params,
+    #         batch_data,
+    #     )
+    #     updates, opt_state = optimizer.update(grads, training_state.opt_state)
+    #     params = optax.apply_updates(training_state.params, updates)
+    #     return params, opt_state, loss
 
-            # Training step
-            params, opt_state, loss = train_step(
-                training_state.params,
-                training_state.opt_state,
-                x_batch,
-                c_batch,
-                true_sols_batch,
-                true_objs_batch,
-            )
+    # def train_epoch(state: TrainingState, batch_data: BatchData):
+    #     """Train on batch data using scan."""
 
-            new_state = TrainingState(
-                params=params,
-                opt_state=opt_state,
-                data_index=training_state.data_index + 1,
-            )
+    #     def scan_fn(carry, _):
+    #         training_state = carry
+    #         data_idx = jnp.mod(state.data_index, batch_data.x.shape[0])
+    #         minibatch_data = BatchData(
+    #             x=batch_data.x[data_idx],
+    #             c=batch_data.c[data_idx],
+    #             true_sols=batch_data.true_sols[data_idx],
+    #             true_objs=batch_data.true_objs[data_idx],
+    #         )
 
-            return new_state, loss
+    #         # Training step
+    #         params, opt_state, loss = train_step(training_state, minibatch_data)
 
-        final_state, batch_losses = jax.lax.scan(scan_fn, state, length=length)
-        metrics = {
-            "train_loss": batch_losses[-1],
-        }
+    #         new_state = TrainingState(
+    #             params=params,
+    #             opt_state=opt_state,
+    #             data_index=training_state.data_index + 1,
+    #         )
 
-        return final_state, metrics
+    #         return new_state, loss
+
+    #     final_state, batch_losses = jax.lax.scan(scan_fn, state, length=length)
+    #     metrics = {
+    #         "train_loss": batch_losses[-1],
+    #     }
+
+    #     return final_state, metrics
 
     return train_epoch
 
@@ -199,47 +244,32 @@ def create_train_epoch(optimizer, loss_fn, length):
 def create_val_epoch(model, batch_optimize, loss_fn):
     """Create function to evaluate model on train and test datasets."""
 
-    def val_step(params, x_data, c_data, true_sols_data, true_objs_data):
+    def val_step(params, batch_data: BatchData):
         """Evaluate model on entire dataset."""
-        pred_c = model.apply(params, x_data)
-        loss = loss_fn(pred_c, c_data, true_sols_data, true_objs_data)
+        pred_c = model.apply(params, batch_data.x)
+        loss = loss_fn(
+            pred_c, batch_data.c, batch_data.true_sols, batch_data.true_objs
+        )
         pred_sol, pred_obj = batch_optimize(pred_c)
-        true_objs_pred = jnp.mean(jnp.sum(pred_sol * c_data, axis=1), axis=0)
-        subopt = 1 - true_objs_pred / jnp.mean(true_objs_data)
+        true_objs_pred = jnp.mean(
+            jnp.sum(pred_sol * batch_data.c, axis=1), axis=0
+        )
+        subopt = 1 - true_objs_pred / jnp.mean(batch_data.true_objs)
         return {
             "loss": loss,
             "subopt": subopt,
             "pred_obj": pred_obj.mean(),
             "true_obj": true_objs_pred,
-            "l2_err_c": jnp.mean(jnp.sum((pred_c - c_data) ** 2, axis=1)),
+            "l2_err_c": jnp.mean(jnp.sum((pred_c - batch_data.c) ** 2, axis=1)),
             "l2_err_soln": jnp.mean(
-                jnp.sum((pred_sol - true_sols_data) ** 2, axis=1)
+                jnp.sum((pred_sol - batch_data.true_sols) ** 2, axis=1)
             ),
         }
 
-    def val_epoch(
-        params,
-        x_train_all,
-        c_train_all,
-        true_sols_train_all,
-        true_objs_train_all,
-        x_test,
-        c_test,
-        true_sols_test,
-        true_objs_test,
-    ):
+    def val_epoch(params, train_data: BatchData, test_data: BatchData):
         """Evaluate model on full train and test datasets."""
-        train_loss = val_step(
-            params,
-            x_train_all,
-            c_train_all,
-            true_sols_train_all,
-            true_objs_train_all,
-        )
-
-        val_loss = val_step(
-            params, x_test, c_test, true_sols_test, true_objs_test
-        )
+        train_loss = val_step(params, train_data)
+        val_loss = val_step(params, test_data)
 
         return {
             **{"train/" + k: v for k, v in train_loss.items()},
@@ -324,7 +354,7 @@ def main(cfg: DictConfig) -> None:
 
     # Initialize training state
     training_state = TrainingState(
-        params=params, opt_state=opt_state, data_index=0
+        params=params, opt_state=opt_state, data_index=jnp.zeros(1)
     )
 
     # Precompute true solutions and objectives for training and validation data with caching
@@ -357,7 +387,12 @@ def main(cfg: DictConfig) -> None:
     loss_fn = create_loss_fn(model, spo_loss)
 
     train_epoch = jax.jit(
-        create_train_epoch(optimizer, loss_fn, config.training.batches_per_eval)
+        create_train_epoch(
+            optimizer,
+            loss_fn,
+            config.training.batches_per_eval,
+            config.training.picard.window_size,
+        )
     )
     val_epoch = jax.jit(create_val_epoch(model, batch_optimize, spo_loss))
 
@@ -367,17 +402,22 @@ def main(cfg: DictConfig) -> None:
 
     batch_size = config.training.batch_size
     num_batches = n_train // batch_size
+    eff_n_train = num_batches * batch_size
     batches_per_epoch = cfg.training.batches_per_epoch or num_batches
     num_evals_per_epoch = num_batches // cfg.training.batches_per_eval
-    assert (
-        n_train % batch_size == 0
-    ), "For now, train_size must be divisible by batch_size."
 
-    data = (
-        x_train,
-        c_train,
-        true_sols_train,
-        true_objs_train,
+    train_batch_data = BatchData(
+        x=x_train,
+        c=c_train,
+        true_sols=true_sols_train,
+        true_objs=true_objs_train,
+    )
+
+    test_batch_data = BatchData(
+        x=x_test,
+        c=c_test,
+        true_sols=true_sols_test,
+        true_objs=true_objs_test,
     )
 
     start_time = time.time()
@@ -396,15 +436,16 @@ def main(cfg: DictConfig) -> None:
 
         # Shuffle training data
         perm = jax.random.permutation(jax.random.PRNGKey(epoch_idx), n_train)
+        shuffled_train_data = BatchData(
+            x=train_batch_data.x[perm],
+            c=train_batch_data.c[perm],
+            true_sols=train_batch_data.true_sols[perm],
+            true_objs=train_batch_data.true_objs[perm],
+        )
+
         batches = jax.tree.map(
-            lambda data: data[perm].reshape(
-                (
-                    num_batches,
-                    batch_size,
-                    -1,
-                )
-            ),
-            data,
+            lambda x: x[:eff_n_train].reshape((num_batches, batch_size, -1)),
+            shuffled_train_data,
         )
 
         def eval_step(carry, eval_idx):
@@ -412,27 +453,52 @@ def main(cfg: DictConfig) -> None:
             ts, gs = carry
 
             # Training
-            ts, train_metrics = train_epoch(ts, batches)
+            ts = train_epoch(ts, batches)
+            train_metrics = {}  # FIXME
 
             # Validation
-            val_metrics = val_epoch(
-                ts.params,
-                x_train,
-                c_train,
-                true_sols_train,
-                true_objs_train,
-                x_test,
-                c_test,
-                true_sols_test,
-                true_objs_test,
+            val_metrics = jax.vmap(val_epoch, in_axes=(0, None, None))(
+                ts.params, train_batch_data, test_batch_data
             )
+
+            best_t = jnp.argmin(val_metrics["val/subopt"])
 
             # Log all metrics
             all_metrics = {
                 **{"train/" + k: v for k, v in train_metrics.items()},
-                **{"val/" + k: v for k, v in val_metrics.items()},
+                **{"val/first/" + k: v[0] for k, v in val_metrics.items()},
+                **{"val/best/" + k: v[best_t] for k, v in val_metrics.items()},
+                **{"val/last/" + k: v[-1] for k, v in val_metrics.items()},
             }
 
+            if config.training.picard.restart_rule == "best":
+                restart_t = best_t
+            elif config.training.picard.restart_rule == "last":
+                restart_t = -1
+            elif config.training.picard.restart_rule == "first":
+                restart_t = 0
+            else:
+                raise ValueError(
+                    f"Unknown restart rule {config.training.picard.restart_rule} (best, last, first are supported)."
+                )
+
+            if config.training.picard.fill_rule == "best":
+                fill_t = best_t
+            elif config.training.picard.fill_rule == "last":
+                fill_t = -1
+            else:
+                raise ValueError(
+                    f"Unknown fill rule {config.training.picard.fill_rule} (best, last are supported)."
+                )
+
+            window_size = config.training.picard.window_size
+            window_idx = jnp.arange(window_size)
+            new_window_idx = jnp.where(
+                window_idx >= window_size - restart_t,
+                jnp.roll(window_idx, -restart_t, axis=0),
+                fill_t,
+            )
+            ts = jax.tree.map(lambda x: x[new_window_idx], ts)
             new_gs = gs + cfg.training.batches_per_eval
             io_callback(log_metrics_callback, None, all_metrics, new_gs)
 
@@ -448,7 +514,15 @@ def main(cfg: DictConfig) -> None:
         return (final_ts, final_gs), None
 
     # Run all epochs using scan
-    initial_carry = (training_state, 0)
+    initial_carry = (
+        jax.tree.map(
+            lambda x: jnp.repeat(
+                x[None, ...], config.training.picard.window_size, axis=0
+            ),
+            training_state,
+        ),
+        0,
+    )
     (final_training_state, final_global_step), _ = jax.lax.scan(
         train_eval_step, initial_carry, jnp.arange(config.training.n_epochs)
     )
