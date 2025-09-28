@@ -14,6 +14,10 @@ import time
 from pprint import pprint
 from jax_tqdm import scan_tqdm
 from jax.experimental import io_callback
+import hashlib
+import pickle
+import os
+import tempfile
 
 
 @dataclass
@@ -21,6 +25,55 @@ class TrainingState:
     params: dict
     opt_state: dict
     data_index: int = 0
+
+
+def create_data_hash(data_arrays):
+    """Create a hash from multiple data arrays for cache key generation."""
+    hash_obj = hashlib.sha256()
+    for arr in data_arrays:
+        # Convert JAX array to numpy for consistent hashing
+        np_arr = jnp.asarray(arr)
+        hash_obj.update(np_arr.tobytes())
+    return hash_obj.hexdigest()
+
+
+def get_cache_path(data_hash, cache_type="optimal_solutions"):
+    """Get cache file path in temp directory."""
+    temp_dir = tempfile.gettempdir()
+    cache_filename = f"{cache_type}_{data_hash}.pkl"
+    return os.path.join(temp_dir, cache_filename)
+
+
+def load_cached_solutions(data_hash):
+    """Load cached optimal solutions if they exist."""
+    cache_path = get_cache_path(data_hash)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                cached_data = pickle.load(f)
+                print(f"Loaded cached solutions from {cache_path}")
+                return cached_data['train_sols'], cached_data['train_objs'], cached_data['test_sols'], cached_data['test_objs']
+        except Exception as e:
+            print(f"Error loading cache: {e}")
+            return None
+    return None
+
+
+def save_cached_solutions(data_hash, train_sols, train_objs, test_sols, test_objs):
+    """Save optimal solutions to cache."""
+    cache_path = get_cache_path(data_hash)
+    try:
+        cached_data = {
+            'train_sols': train_sols,
+            'train_objs': train_objs, 
+            'test_sols': test_sols,
+            'test_objs': test_objs
+        }
+        with open(cache_path, 'wb') as f:
+            pickle.dump(cached_data, f)
+        print(f"Saved solutions to cache: {cache_path}")
+    except Exception as e:
+        print(f"Error saving cache: {e}")
 
 
 def create_batch_optimizer(A, b, G, h, optimizer_config):
@@ -267,11 +320,22 @@ def main(cfg: DictConfig) -> None:
         params=params, opt_state=opt_state, data_index=0
     )
 
-    # Precompute true solutions and objectives for training and validation data
-    print("Computing true solutions for training data...")
-    true_sols_train, true_objs_train = batch_optimize(c_train)
-    print("Computing true solutions for validation data...")
-    true_sols_test, true_objs_test = batch_optimize(c_test)
+    # Precompute true solutions and objectives for training and validation data with caching
+    data_hash = create_data_hash([c_train, c_test, G, h])
+    print(f"Data hash: {data_hash}")
+    
+    # Try to load cached solutions
+    cached_solutions = load_cached_solutions(data_hash)
+    if cached_solutions is not None:
+        true_sols_train, true_objs_train, true_sols_test, true_objs_test = cached_solutions
+    else:
+        print("Computing true solutions for training data...")
+        true_sols_train, true_objs_train = batch_optimize(c_train)
+        print("Computing true solutions for validation data...")
+        true_sols_test, true_objs_test = batch_optimize(c_test)
+        
+        # Save to cache
+        save_cached_solutions(data_hash, true_sols_train, true_objs_train, true_sols_test, true_objs_test)
     loss_fn = create_loss_fn(model, spo_loss)
 
     train_epoch = jax.jit(
