@@ -1,5 +1,7 @@
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh, PartitionSpec as P
+from jax.experimental.shard_map import shard_map
 from mpax import create_lp, r2HPDHG
 from sklearn.model_selection import train_test_split
 import pyepo
@@ -19,6 +21,7 @@ import pickle
 import os
 import tempfile
 from typing import Tuple
+import numpy as np
 
 
 @dataclass
@@ -154,7 +157,7 @@ def create_loss_fn(model, spo_loss):
     return loss_fn
 
 
-def create_train_epoch(optimizer, loss_fn, length, window_size):
+def create_train_epoch(optimizer, loss_fn, length, window_size, mesh):
     """Create function to train on batch data using scan."""
 
     def picard_mapper(training_state: TrainingState, batch_data: BatchData):
@@ -175,11 +178,24 @@ def create_train_epoch(optimizer, loss_fn, length, window_size):
         )
         return new_state, new_state
 
+    def shard_picard_mapper(
+        training_state: TrainingState, batch_data: BatchData
+    ):
+        grads = jax.vmap(picard_mapper, in_axes=(0, 0))(
+            training_state, batch_data
+        )
+        return grads
+
     def picard_iteration(_, state_and_data: Tuple[TrainingState, BatchData]):
         training_state, batch_data = state_and_data
-        grads = jax.vmap(picard_mapper, in_axes=(0, 0))(
-            training_state, jax.tree.map(lambda x: x[:window_size], batch_data)
-        )
+        grads = shard_map(
+            shard_picard_mapper,
+            mesh=mesh,
+            in_specs=(P("picard"), P("picard", "batch")),
+            out_specs=P("picard", "batch"),
+            check_rep=False,
+        )(training_state, jax.tree.map(lambda x: x[:window_size], batch_data))
+        grads = jax.tree.map(lambda x: jnp.mean(x, axis=1), grads)
         init_state = jax.tree.map(
             lambda x: x[0],
             training_state,
@@ -196,47 +212,6 @@ def create_train_epoch(optimizer, loss_fn, length, window_size):
             0, length, picard_iteration, (training_state, batch_data)
         )
         return final_state
-
-    # def train_step(training_state, batch_data: BatchData):
-    #     """Single training step."""
-    #     loss, grads = jax.value_and_grad(loss_fn)(
-    #         training_state.params,
-    #         batch_data,
-    #     )
-    #     updates, opt_state = optimizer.update(grads, training_state.opt_state)
-    #     params = optax.apply_updates(training_state.params, updates)
-    #     return params, opt_state, loss
-
-    # def train_epoch(state: TrainingState, batch_data: BatchData):
-    #     """Train on batch data using scan."""
-
-    #     def scan_fn(carry, _):
-    #         training_state = carry
-    #         data_idx = jnp.mod(state.data_index, batch_data.x.shape[0])
-    #         minibatch_data = BatchData(
-    #             x=batch_data.x[data_idx],
-    #             c=batch_data.c[data_idx],
-    #             true_sols=batch_data.true_sols[data_idx],
-    #             true_objs=batch_data.true_objs[data_idx],
-    #         )
-
-    #         # Training step
-    #         params, opt_state, loss = train_step(training_state, minibatch_data)
-
-    #         new_state = TrainingState(
-    #             params=params,
-    #             opt_state=opt_state,
-    #             data_index=training_state.data_index + 1,
-    #         )
-
-    #         return new_state, loss
-
-    #     final_state, batch_losses = jax.lax.scan(scan_fn, state, length=length)
-    #     metrics = {
-    #         "train_loss": batch_losses[-1],
-    #     }
-
-    #     return final_state, metrics
 
     return train_epoch
 
@@ -357,6 +332,17 @@ def main(cfg: DictConfig) -> None:
         params=params, opt_state=opt_state, data_index=jnp.zeros(1)
     )
 
+    # Create mesh from config
+    devices = jax.devices()
+    requested_devices = cfg.training.mesh["batch"] * cfg.training.mesh["picard"]
+    devices = np.array(jax.devices()[:requested_devices])
+    mesh = Mesh(
+        devices.reshape(
+            (cfg.training.mesh["picard"], cfg.training.mesh["batch"])
+        ),
+        axis_names=("picard", "batch"),
+    )
+
     # Precompute true solutions and objectives for training and validation data with caching
     data_hash = create_data_hash([c_train, c_test, G, h])
     print(f"Data hash: {data_hash}")
@@ -386,15 +372,14 @@ def main(cfg: DictConfig) -> None:
         )
     loss_fn = create_loss_fn(model, spo_loss)
 
-    train_epoch = jax.jit(
-        create_train_epoch(
-            optimizer,
-            loss_fn,
-            config.training.batches_per_eval,
-            config.training.picard.window_size,
-        )
+    train_epoch = create_train_epoch(
+        optimizer,
+        loss_fn,
+        config.training.batches_per_eval,
+        config.training.picard.window_size,
+        mesh,
     )
-    val_epoch = jax.jit(create_val_epoch(model, batch_optimize, spo_loss))
+    val_epoch = create_val_epoch(model, batch_optimize, spo_loss)
 
     # Training loop
     n_train = len(x_train)
@@ -405,6 +390,10 @@ def main(cfg: DictConfig) -> None:
     eff_n_train = num_batches * batch_size
     batches_per_epoch = cfg.training.batches_per_epoch or num_batches
     num_evals_per_epoch = num_batches // cfg.training.batches_per_eval
+
+    assert (
+        num_batches >= cfg.training.picard.window_size
+    ), "Number of batches per eval must be at least as large as Picard window size."
 
     train_batch_data = BatchData(
         x=x_train,
@@ -448,6 +437,14 @@ def main(cfg: DictConfig) -> None:
             shuffled_train_data,
         )
 
+        def shard_val_epoch(params, train_data, test_data):
+            results = jax.vmap(val_epoch, in_axes=(0, None, None))(
+                params, train_data, test_data
+            )
+            # results = jax.lax.pmean(results, axis_name="batch")
+            results = jax.tree.map(lambda x: x.reshape(-1, 1), results)
+            return results
+
         def eval_step(carry, eval_idx):
             """Single evaluation step within an epoch."""
             ts, gs = carry
@@ -457,8 +454,16 @@ def main(cfg: DictConfig) -> None:
             train_metrics = {}  # FIXME
 
             # Validation
-            val_metrics = jax.vmap(val_epoch, in_axes=(0, None, None))(
-                ts.params, train_batch_data, test_batch_data
+
+            val_metrics = shard_map(
+                shard_val_epoch,
+                mesh=mesh,
+                in_specs=(P("picard"), P("batch"), P("batch")),
+                out_specs=P("picard", "batch"),
+                check_rep=False,
+            )(ts.params, train_batch_data, test_batch_data)
+            val_metrics = jax.tree.map(
+                lambda x: jnp.mean(x, axis=1), val_metrics
             )
 
             best_t = jnp.argmin(val_metrics["val/subopt"])

@@ -1,5 +1,5 @@
   m: 16 # number of items
-  n: 100  # number of data
+  n: 1000 # number of data
   p: 5  # size of feature
   deg: 6  # polynomial degree
   dim: 2 # dimension of knapsack
