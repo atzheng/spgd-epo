@@ -1,0 +1,3 @@
+_target_: picard_epo.models.mlp.Linear
+dim: 9
+

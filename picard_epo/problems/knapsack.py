@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from .problem import Problem
 import pyepo
 from mpax import create_lp, r2HPDHG
+import pooch
 
 from picard_epo.problems.utils import (
     create_problem_data_hash,
@@ -34,6 +35,42 @@ class KnapsackProblem(Problem):
 
     def batch_optimize(self, c_vectors):
         return jax.vmap(self.single_optimize)(c_vectors)
+
+    @classmethod
+    def from_predopt(cls, m, capacity):
+        """
+        Load knapsack problem instance from PredOpt benchmark dataset.
+        Replicating data loading logic from
+        preopt-benchmarks/Knapsack/Trainer/data_utils.py#L29
+
+        739 samples x 48 items x 9 features x 1 resource
+        """
+        url = "https://raw.githubusercontent.com/PredOpt/predopt-benchmarks/main/Knapsack/Trainer/Data.npz"
+        data_hash = "04c49e92024fe284641ef9b27b47b2c4"
+        fname = pooch.retrieve(
+            url,
+            known_hash="md5:" + data_hash,
+            fname="Data.npz",
+            path=pooch.os_cache("predopt"),
+        )
+        data = jnp.load(fname)
+        x_train, x_test, y_train, y_test = (
+            data["X_1gtrain"],
+            data["X_1gtest"],
+            data["y_train"],
+            data["y_test"],
+        )
+        x_train = x_train.reshape(-1, 48 * x_train.shape[1])
+        y_train = y_train.reshape(-1, 48)
+        x_test = x_test.reshape(-1, 48 * x_test.shape[1])
+        y_test = y_test.reshape(-1, 48)
+        return cls(
+            x=jnp.concatenate([x_train, x_test], axis=0, dtype=jnp.float32),
+            c=jnp.concatenate([y_train, y_test], axis=0, dtype=jnp.float32),
+            weights=data["weights"].astype(jnp.float32).reshape(1, -1),
+            capacities=capacity * jnp.ones(1, dtype=jnp.float32),
+            data_hash=data_hash,
+        )
 
     @classmethod
     def from_pyepo(

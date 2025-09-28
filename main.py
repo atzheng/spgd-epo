@@ -185,8 +185,16 @@ def main(config: DictConfig) -> None:
         test_size=config.training.test_size,
         random_state=config.training.random_seed,
     )
+
+    # Ensure train / test sizes is divisible by mesh
+    mesh_batch = config.training.mesh.batch
+    train_idx = train_idx[: len(train_idx) // mesh_batch * mesh_batch]
+    test_idx = test_idx[: len(test_idx) // mesh_batch * mesh_batch]
     n_train = len(train_idx)
     n_test = len(test_idx)
+
+    # TODO Warn here
+
     train_data = jax.tree.map(lambda x: x[train_idx], dataset)
     test_data = jax.tree.map(lambda x: x[test_idx], dataset)
     spo_loss = create_spo_loss(problem.batch_optimize)
@@ -206,13 +214,11 @@ def main(config: DictConfig) -> None:
 
     # Create mesh from config
     devices = jax.devices()
-    requested_devices = (
-        config.training.mesh["batch"] * config.training.mesh["picard"]
-    )
+    requested_devices = config.training.mesh.batch * config.training.mesh.picard
     devices = np.array(jax.devices()[:requested_devices])
     mesh = Mesh(
         devices.reshape(
-            (config.training.mesh["picard"], config.training.mesh["batch"])
+            (config.training.mesh.picard, config.training.mesh.batch)
         ),
         axis_names=("picard", "batch"),
     )
@@ -234,7 +240,9 @@ def main(config: DictConfig) -> None:
     batch_size = config.training.batch_size
     num_batches = n_train // batch_size
     eff_n_train = num_batches * batch_size
-    num_evals_per_epoch = max(num_batches // config.training.batches_per_eval, 1)
+    num_evals_per_epoch = max(
+        num_batches // config.training.batches_per_eval, 1
+    )
 
     assert (
         num_batches >= config.training.picard.window_size
