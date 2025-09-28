@@ -95,6 +95,59 @@ def save_cached_solutions(
         print(f"Error saving cache: {e}")
 
 
+def create_problem_data_hash(config_data):
+    """Create a hash from problem generation config parameters for cache key generation."""
+    hash_obj = hashlib.sha256()
+    # Hash the parameters that affect data generation
+    params = [
+        config_data.n + config_data.test_size,  # total size
+        config_data.p,  # feature dimension
+        config_data.m,  # item count
+        config_data.deg,  # polynomial degree
+        config_data.dim,  # constraint dimension
+        config_data.noise_width,  # noise parameter
+        config_data.caps_per_dim,  # capacity per dimension
+    ]
+    for param in params:
+        hash_obj.update(str(param).encode())
+    return hash_obj.hexdigest()
+
+
+def load_cached_problem_data(problem_hash):
+    """Load cached problem data if it exists."""
+    cache_path = get_cache_path(problem_hash, "problem_data")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                cached_data = pickle.load(f)
+                print(f"Loaded cached problem data from {cache_path}")
+                return (
+                    cached_data["weights"],
+                    cached_data["x"],
+                    cached_data["c"],
+                )
+        except Exception as e:
+            print(f"Error loading problem data cache: {e}")
+            return None
+    return None
+
+
+def save_cached_problem_data(problem_hash, weights, x, c):
+    """Save generated problem data to cache."""
+    cache_path = get_cache_path(problem_hash, "problem_data")
+    try:
+        cached_data = {
+            "weights": weights,
+            "x": x,
+            "c": c,
+        }
+        with open(cache_path, "wb") as f:
+            pickle.dump(cached_data, f)
+        print(f"Saved problem data to cache: {cache_path}")
+    except Exception as e:
+        print(f"Error saving problem data cache: {e}")
+
+
 def create_batch_optimizer(A, b, G, h, optimizer_config):
     """Create a batched optimization function."""
 
@@ -280,15 +333,28 @@ def main(cfg: DictConfig) -> None:
         project="picard-epo", config=OmegaConf.to_container(cfg, resolve=True)
     )
 
-    # Generate data for 2D knapsack
-    weights, x, c = pyepo.data.knapsack.genData(
-        config.data.n + config.data.test_size,
-        config.data.p,
-        config.data.m,
-        deg=config.data.deg,
-        dim=config.data.dim,
-        noise_width=config.data.noise_width,
-    )
+    # Generate data for 2D knapsack with caching
+    problem_hash = create_problem_data_hash(config.data)
+    print(f"Problem data hash: {problem_hash}")
+
+    # Try to load cached problem data
+    cached_problem = load_cached_problem_data(problem_hash)
+    if cached_problem is not None:
+        weights, x, c = cached_problem
+    else:
+        print("Generating data...")
+        weights, x, c = pyepo.data.knapsack.genData(
+            config.data.n + config.data.test_size,
+            config.data.p,
+            config.data.m,
+            deg=config.data.deg,
+            dim=config.data.dim,
+            noise_width=config.data.noise_width,
+        )
+        print("Data generation complete.")
+
+        # Save to cache
+        save_cached_problem_data(problem_hash, weights, x, c)
 
     c = -c  # pyepo generates costs for minimization; we want maximization
 
