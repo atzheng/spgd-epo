@@ -1,5 +1,5 @@
 defaults:
-  - data: test
+  - problem: pyepo_knapsack
   - model: mlp
 
 optimizer:
@@ -8,13 +8,13 @@ optimizer:
   solver_verbose: false
 
 training:
+  test_size: 100
   learning_rate: 0.0001
   batch_size: 32
   n_epochs: 100
   random_seed: 42
   algo: sequential
   batches_per_eval: 128
-  batches_per_epoch: null
   mesh:
     picard: 1
     batch: 1

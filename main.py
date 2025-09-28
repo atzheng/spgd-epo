@@ -2,9 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
-from mpax import create_lp, r2HPDHG
 from sklearn.model_selection import train_test_split
-import pyepo
 import flax.linen as nn
 import optax
 import hydra
@@ -14,14 +12,12 @@ from flax.struct import dataclass
 import wandb
 import time
 from pprint import pprint
-from jax_tqdm import scan_tqdm
 from jax.experimental import io_callback
-import hashlib
-import pickle
-import os
-import tempfile
 from typing import Tuple
 import numpy as np
+from hydra.utils import instantiate
+
+from picard_epo.problems.problem import Problem, BatchData
 
 
 @dataclass
@@ -29,144 +25,6 @@ class TrainingState:
     params: dict
     opt_state: dict
     data_index: int = 0
-
-
-@dataclass
-class BatchData:
-    x: jnp.ndarray
-    c: jnp.ndarray
-    true_sols: jnp.ndarray
-    true_objs: jnp.ndarray
-
-
-def create_data_hash(data_arrays):
-    """Create a hash from multiple data arrays for cache key generation."""
-    hash_obj = hashlib.sha256()
-    for arr in data_arrays:
-        # Convert JAX array to numpy for consistent hashing
-        np_arr = jnp.asarray(arr)
-        hash_obj.update(np_arr.tobytes())
-    return hash_obj.hexdigest()
-
-
-def get_cache_path(data_hash, cache_type="optimal_solutions"):
-    """Get cache file path in temp directory."""
-    temp_dir = tempfile.gettempdir()
-    cache_filename = f"{cache_type}_{data_hash}.pkl"
-    return os.path.join(temp_dir, cache_filename)
-
-
-def load_cached_solutions(data_hash):
-    """Load cached optimal solutions if they exist."""
-    cache_path = get_cache_path(data_hash)
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "rb") as f:
-                cached_data = pickle.load(f)
-                print(f"Loaded cached solutions from {cache_path}")
-                return (
-                    cached_data["train_sols"],
-                    cached_data["train_objs"],
-                    cached_data["test_sols"],
-                    cached_data["test_objs"],
-                )
-        except Exception as e:
-            print(f"Error loading cache: {e}")
-            return None
-    return None
-
-
-def save_cached_solutions(
-    data_hash, train_sols, train_objs, test_sols, test_objs
-):
-    """Save optimal solutions to cache."""
-    cache_path = get_cache_path(data_hash)
-    try:
-        cached_data = {
-            "train_sols": train_sols,
-            "train_objs": train_objs,
-            "test_sols": test_sols,
-            "test_objs": test_objs,
-        }
-        with open(cache_path, "wb") as f:
-            pickle.dump(cached_data, f)
-        print(f"Saved solutions to cache: {cache_path}")
-    except Exception as e:
-        print(f"Error saving cache: {e}")
-
-
-def create_problem_data_hash(config_data):
-    """Create a hash from problem generation config parameters for cache key generation."""
-    hash_obj = hashlib.sha256()
-    # Hash the parameters that affect data generation
-    params = [
-        config_data.n + config_data.test_size,  # total size
-        config_data.p,  # feature dimension
-        config_data.m,  # item count
-        config_data.deg,  # polynomial degree
-        config_data.dim,  # constraint dimension
-        config_data.noise_width,  # noise parameter
-        config_data.caps_per_dim,  # capacity per dimension
-    ]
-    for param in params:
-        hash_obj.update(str(param).encode())
-    return hash_obj.hexdigest()
-
-
-def load_cached_problem_data(problem_hash):
-    """Load cached problem data if it exists."""
-    cache_path = get_cache_path(problem_hash, "problem_data")
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "rb") as f:
-                cached_data = pickle.load(f)
-                print(f"Loaded cached problem data from {cache_path}")
-                return (
-                    cached_data["weights"],
-                    cached_data["x"],
-                    cached_data["c"],
-                )
-        except Exception as e:
-            print(f"Error loading problem data cache: {e}")
-            return None
-    return None
-
-
-def save_cached_problem_data(problem_hash, weights, x, c):
-    """Save generated problem data to cache."""
-    cache_path = get_cache_path(problem_hash, "problem_data")
-    try:
-        cached_data = {
-            "weights": weights,
-            "x": x,
-            "c": c,
-        }
-        with open(cache_path, "wb") as f:
-            pickle.dump(cached_data, f)
-        print(f"Saved problem data to cache: {cache_path}")
-    except Exception as e:
-        print(f"Error saving problem data cache: {e}")
-
-
-def create_batch_optimizer(A, b, G, h, optimizer_config):
-    """Create a batched optimization function."""
-
-    def single_optimize(c_vector):
-        """
-        Returns the solution and optimal objective value for a single LP,
-        MAXIMIZING c^T x
-        """
-        lp = create_lp(c_vector, A, b, G, h, 0, 1)
-        solver = r2HPDHG(
-            eps_abs=optimizer_config.solver_eps_abs,
-            eps_rel=optimizer_config.solver_eps_rel,
-            verbose=optimizer_config.solver_verbose,
-        )
-        result = solver.optimize(lp)
-        obj = jnp.dot(c_vector, result.primal_solution)
-        return result.primal_solution, obj
-
-    return jax.vmap(single_optimize)
 
 
 def create_spo_loss(batch_optimize):
@@ -307,88 +165,36 @@ def create_val_epoch(model, batch_optimize, loss_fn):
     return val_epoch
 
 
-class MLP(nn.Module):
-    """Multi-layer perceptron for predicting c from x."""
-
-    hidden_sizes: list
-    output_size: int
-
-    @nn.compact
-    def __call__(self, x):
-        for size in self.hidden_sizes:
-            x = nn.Dense(size)(x)
-            x = nn.relu(x)
-        x = nn.Dense(self.output_size)(x)  # Output layer predicts c values
-        return x
-
-
 @hydra.main(version_base=None, config_path="conf", config_name="config")
-def main(cfg: DictConfig) -> None:
+def main(config: DictConfig) -> None:
     # Convert DictConfig to our dataclass
-    print(omegaconf.OmegaConf.to_yaml(cfg))
-    config = cfg
+    print(omegaconf.OmegaConf.to_yaml(config))
 
     # Initialize wandb
     wandb.init(
-        project="picard-epo", config=OmegaConf.to_container(cfg, resolve=True)
+        project="picard-epo",
+        config=OmegaConf.to_container(config, resolve=True),
     )
 
-    # Generate data for 2D knapsack with caching
-    problem_hash = create_problem_data_hash(config.data)
-    print(f"Problem data hash: {problem_hash}")
-
-    # Try to load cached problem data
-    cached_problem = load_cached_problem_data(problem_hash)
-    if cached_problem is not None:
-        weights, x, c = cached_problem
-    else:
-        print("Generating data...")
-        weights, x, c = pyepo.data.knapsack.genData(
-            config.data.n + config.data.test_size,
-            config.data.p,
-            config.data.m,
-            deg=config.data.deg,
-            dim=config.data.dim,
-            noise_width=config.data.noise_width,
-        )
-        print("Data generation complete.")
-
-        # Save to cache
-        save_cached_problem_data(problem_hash, weights, x, c)
-
-    c = -c  # pyepo generates costs for minimization; we want maximization
-
-    # Data split
-    x_train, x_test, c_train, c_test = list(
-        map(
-            jnp.asarray,
-            train_test_split(
-                x,
-                c,
-                test_size=config.data.test_size,
-                random_state=config.data.random_state,
-            ),
-        )
+    # Data Generation
+    problem: Problem = instantiate(config.problem)
+    dataset: BatchData = problem.dataset
+    n = len(dataset)
+    train_idx, test_idx = train_test_split(
+        jnp.arange(n),
+        test_size=config.training.test_size,
+        random_state=config.training.random_seed,
     )
-
-    # Setup optimization constraints
-    caps = [config.data.caps_per_dim] * config.data.dim
-    A = jax.experimental.sparse.empty((config.data.dim, config.data.m))
-    b = jnp.zeros((config.data.dim,))
-    G = -jnp.asarray(weights)
-    h = -jnp.array(caps)
-
-    batch_optimize = create_batch_optimizer(A, b, G, h, config.optimizer)
-
-    spo_loss = create_spo_loss(batch_optimize)
+    n_train = len(train_idx)
+    n_test = len(test_idx)
+    train_data = jax.tree.map(lambda x: x[train_idx], dataset)
+    test_data = jax.tree.map(lambda x: x[test_idx], dataset)
+    spo_loss = create_spo_loss(problem.batch_optimize)
 
     # Initialize model and optimizer
-    model = MLP(
-        hidden_sizes=config.model.hidden_sizes, output_size=config.data.m
-    )
+    model = instantiate(config.model)
     key = jax.random.PRNGKey(config.training.random_seed)
-    dummy_x = jnp.ones((1, config.data.p))  # dummy input for initialization
-    params = model.init(key, dummy_x)
+    params = model.init(key, dataset.x[0:1])
 
     optimizer = optax.adam(learning_rate=config.training.learning_rate)
     opt_state = optimizer.init(params)
@@ -400,42 +206,17 @@ def main(cfg: DictConfig) -> None:
 
     # Create mesh from config
     devices = jax.devices()
-    requested_devices = cfg.training.mesh["batch"] * cfg.training.mesh["picard"]
+    requested_devices = (
+        config.training.mesh["batch"] * config.training.mesh["picard"]
+    )
     devices = np.array(jax.devices()[:requested_devices])
     mesh = Mesh(
         devices.reshape(
-            (cfg.training.mesh["picard"], cfg.training.mesh["batch"])
+            (config.training.mesh["picard"], config.training.mesh["batch"])
         ),
         axis_names=("picard", "batch"),
     )
 
-    # Precompute true solutions and objectives for training and validation data with caching
-    data_hash = create_data_hash([c_train, c_test, G, h])
-    print(f"Data hash: {data_hash}")
-
-    # Try to load cached solutions
-    cached_solutions = load_cached_solutions(data_hash)
-    if cached_solutions is not None:
-        (
-            true_sols_train,
-            true_objs_train,
-            true_sols_test,
-            true_objs_test,
-        ) = cached_solutions
-    else:
-        print("Computing true solutions for training data...")
-        true_sols_train, true_objs_train = batch_optimize(c_train)
-        print("Computing true solutions for validation data...")
-        true_sols_test, true_objs_test = batch_optimize(c_test)
-
-        # Save to cache
-        save_cached_solutions(
-            data_hash,
-            true_sols_train,
-            true_objs_train,
-            true_sols_test,
-            true_objs_test,
-        )
     loss_fn = create_loss_fn(model, spo_loss)
 
     train_epoch = create_train_epoch(
@@ -445,42 +226,26 @@ def main(cfg: DictConfig) -> None:
         config.training.picard.window_size,
         mesh,
     )
-    val_epoch = create_val_epoch(model, batch_optimize, spo_loss)
+    val_epoch = create_val_epoch(model, problem.batch_optimize, spo_loss)
 
     # Training loop
-    n_train = len(x_train)
     print(f"Starting training for {config.training.n_epochs} epochs...")
 
     batch_size = config.training.batch_size
     num_batches = n_train // batch_size
     eff_n_train = num_batches * batch_size
-    batches_per_epoch = cfg.training.batches_per_epoch or num_batches
-    num_evals_per_epoch = num_batches // cfg.training.batches_per_eval
+    num_evals_per_epoch = max(num_batches // config.training.batches_per_eval, 1)
 
     assert (
-        num_batches >= cfg.training.picard.window_size
+        num_batches >= config.training.picard.window_size
     ), "Number of batches per eval must be at least as large as Picard window size."
-
-    train_batch_data = BatchData(
-        x=x_train,
-        c=c_train,
-        true_sols=true_sols_train,
-        true_objs=true_objs_train,
-    )
-
-    test_batch_data = BatchData(
-        x=x_test,
-        c=c_test,
-        true_sols=true_sols_test,
-        true_objs=true_objs_test,
-    )
 
     start_time = time.time()
 
     # Create logging callbacks
     def log_metrics_callback(metrics, step):
-        print(f"** {time.time() - start_time} seconds **")
         """Host callback for logging metrics to wandb."""
+        print(f"** {time.time() - start_time} seconds **")
         wandb.log(metrics, step=int(step))
         pprint(metrics)
         return None
@@ -491,13 +256,7 @@ def main(cfg: DictConfig) -> None:
 
         # Shuffle training data
         perm = jax.random.permutation(jax.random.PRNGKey(epoch_idx), n_train)
-        shuffled_train_data = BatchData(
-            x=train_batch_data.x[perm],
-            c=train_batch_data.c[perm],
-            true_sols=train_batch_data.true_sols[perm],
-            true_objs=train_batch_data.true_objs[perm],
-        )
-
+        shuffled_train_data = jax.tree.map(lambda x: x[perm], train_data)
         batches = jax.tree.map(
             lambda x: x[:eff_n_train].reshape((num_batches, batch_size, -1)),
             shuffled_train_data,
@@ -527,7 +286,7 @@ def main(cfg: DictConfig) -> None:
                 in_specs=(P("picard"), P("batch"), P("batch")),
                 out_specs=P("picard", "batch"),
                 check_rep=False,
-            )(ts.params, train_batch_data, test_batch_data)
+            )(ts.params, train_data, test_data)
             val_metrics = jax.tree.map(
                 lambda x: jnp.mean(x, axis=1), val_metrics
             )
@@ -570,19 +329,19 @@ def main(cfg: DictConfig) -> None:
                 fill_t,
             )
             ts = jax.tree.map(lambda x: x[new_window_idx], ts)
-            new_gs = gs + cfg.training.batches_per_eval
+            new_gs = gs + config.training.batches_per_eval
             io_callback(log_metrics_callback, None, all_metrics, new_gs)
 
-            return (ts, new_gs), None
+            return (ts, new_gs), all_metrics
 
         # Run all evaluations for this epoch
-        (final_ts, final_gs), _ = jax.lax.scan(
+        (final_ts, final_gs), metrics = jax.lax.scan(
             eval_step,
             (training_state, global_step),
             jnp.arange(num_evals_per_epoch),
         )
 
-        return (final_ts, final_gs), None
+        return (final_ts, final_gs), metrics
 
     # Run all epochs using scan
     initial_carry = (
@@ -594,10 +353,12 @@ def main(cfg: DictConfig) -> None:
         ),
         0,
     )
-    (final_training_state, final_global_step), _ = jax.lax.scan(
+
+    results = jax.lax.scan(
         train_eval_step, initial_carry, jnp.arange(config.training.n_epochs)
     )
-    jax.block_until_ready(final_training_state)
+    jax.block_until_ready(results)
+
     print("Training completed!")
 
     # Finish wandb run
