@@ -7,7 +7,6 @@ import tempfile
 import jax.numpy as jnp
 
 
-
 def get_cache_path(data_hash, cache_type="optimal_solutions"):
     """Get cache file path in temp directory."""
     temp_dir = tempfile.gettempdir()
@@ -42,8 +41,6 @@ def save_cache(data_hash, obj, cache_type):
 
 def create_problem_data_hash(config_data: dict):
     """Create a hash from problem generation config parameters for cache key generation."""
-    return hashlib.sha256().update(str(sorted(config_data.items())).encode())
-
-
-
-
+    sha = hashlib.sha256()
+    sha.update(str(sorted(config_data.items())).encode())
+    return str(sha.hexdigest())

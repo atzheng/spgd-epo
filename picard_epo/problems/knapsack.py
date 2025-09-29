@@ -123,12 +123,9 @@ class KnapsackProblem(Problem):
                 dim=dim,
                 noise_width=noise_width,
             )
+            cached_problem = {"weights": weights, "x": x, "c": c}
             print("Data generation complete.")
-            save_cache(
-                problem_hash,
-                {"weights": weights, "x": x, "c": c},
-                "problem_data",
-            )
+            save_cache(problem_hash, cached_problem, "problem_data")
 
         return cls(
             x=cached_problem["x"],

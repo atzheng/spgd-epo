@@ -1,5 +1,6 @@
 from flax.struct import dataclass
 import jax.numpy as jnp
+import jax
 
 from .utils import load_cache, save_cache
 
@@ -22,8 +23,11 @@ class Problem(object):
         self.c = c
         self.use_cached = use_cached
 
-    def batch_optimize(self, cost):
+    def single_optimize(self, cost):
         raise NotImplementedError()
+
+    def batch_optimize(self, c_vectors):
+        return jax.vmap(self.single_optimize)(c_vectors)
 
     @property
     def dataset(self):
