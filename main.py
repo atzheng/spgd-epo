@@ -99,15 +99,23 @@ def create_train_epoch(optimizer, loss_fn, length, window_size, mesh):
 
     def picard_iteration(state_and_data: Tuple[TrainingState, BatchData], _):
         training_state, batch_data = state_and_data
-        grads, losses = shard_map(
-            shard_picard_mapper,
-            mesh=mesh,
-            in_specs=(P("picard"), P("picard", "batch")),
-            out_specs=(P("picard", "batch"), P("picard","batch")),
-            check_rep=False,
-        )(training_state, jax.tree.map(lambda x: x[:window_size], batch_data))
-        losses = jnp.mean(losses, axis=(1))
-        grads = jax.tree.map(lambda x: jnp.mean(x, axis=1), grads)
+        window_batch = jax.tree.map(lambda x: x[:window_size], batch_data)
+        if mesh is not None:
+            grads, losses = shard_map(
+                shard_picard_mapper,
+                mesh=mesh,
+                in_specs=(P("picard"), P("picard", "batch")),
+                out_specs=(P("picard", "batch"), P("picard", "batch")),
+                check_rep=False,
+            )(training_state, window_batch)
+            # Should be sum not mean?
+            grads = jax.tree.map(lambda x: jnp.mean(x, axis=1), grads)
+            losses = jnp.mean(losses, axis=(1))
+        else:
+            grads, losses = jax.vmap(picard_mapper, in_axes=(0, 0))(
+                training_state, window_batch
+            )
+
         init_state = jax.tree.map(
             lambda x: x[0],
             training_state,
@@ -188,7 +196,9 @@ def main(config: DictConfig) -> None:
     )
 
     # Ensure train / test sizes is divisible by mesh
-    mesh_batch = config.training.mesh.batch
+    mesh_batch = (
+        1 if config.training.mesh is None else config.training.mesh.batch
+    )
     train_idx = train_idx[: (len(train_idx) // mesh_batch) * mesh_batch]
     test_idx = test_idx[: (len(test_idx) // mesh_batch) * mesh_batch]
     n_train = len(train_idx)
@@ -214,15 +224,20 @@ def main(config: DictConfig) -> None:
     )
 
     # Create mesh from config
-    devices = jax.devices()
-    requested_devices = config.training.mesh.batch * config.training.mesh.picard
-    devices = np.array(jax.devices()[:requested_devices])
-    mesh = Mesh(
-        devices.reshape(
-            (config.training.mesh.picard, config.training.mesh.batch)
-        ),
-        axis_names=("picard", "batch"),
-    )
+    if config.training.mesh is not None:
+        devices = jax.devices()
+        requested_devices = (
+            config.training.mesh.batch * config.training.mesh.picard
+        )
+        devices = np.array(jax.devices()[:requested_devices])
+        mesh = Mesh(
+            devices.reshape(
+                (config.training.mesh.picard, config.training.mesh.batch)
+            ),
+            axis_names=("picard", "batch"),
+        )
+    else:
+        mesh = None
 
     loss_fn = create_loss_fn(model, spo_loss)
 
@@ -288,20 +303,25 @@ def main(config: DictConfig) -> None:
             train_metrics = {
                 "train/loss": losses[-1],
                 "train/avg_loss": jnp.mean(losses[-1]),
-            }  
+            }
 
             # Validation
 
-            val_metrics = shard_map(
-                shard_val_epoch,
-                mesh=mesh,
-                in_specs=(P("picard"), P("batch"), P("batch")),
-                out_specs=P("picard", "batch"),
-                check_rep=False,
-            )(ts.params, train_data, test_data)
-            val_metrics = jax.tree.map(
-                lambda x: jnp.mean(x, axis=1), val_metrics
-            )
+            if mesh is not None:
+                val_metrics = shard_map(
+                    shard_val_epoch,
+                    mesh=mesh,
+                    in_specs=(P("picard"), P("batch"), P("batch")),
+                    out_specs=P("picard", "batch"),
+                    check_rep=False,
+                )(ts.params, train_data, test_data)
+                val_metrics = jax.tree.map(
+                    lambda x: jnp.mean(x, axis=1), val_metrics
+                )
+            else:
+                val_metrics = jax.vmap(val_epoch, in_axes=(0, None, None))(
+                    ts.params, train_data, test_data
+                )
 
             best_t = jnp.argmin(val_metrics["val/subopt"])
 
