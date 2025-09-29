@@ -13,8 +13,8 @@ from picard_epo.problems.utils import (
 
 
 class KnapsackProblem(Problem):
-    def __init__(self, x, c, weights, capacities, solver=None, data_hash=None):
-        super().__init__(x=x, c=-c, data_hash=data_hash)
+    def __init__(self, x, c, weights, capacities, solver=None, data_hash=None, **kwargs):
+        super().__init__(x=x, c=-c, data_hash=data_hash, **kwargs)
         self.A = jax.experimental.sparse.empty(weights.shape)
         self.b = jnp.zeros(weights.shape[0])
         self.G = -jnp.asarray(weights)
@@ -37,7 +37,7 @@ class KnapsackProblem(Problem):
         return jax.vmap(self.single_optimize)(c_vectors)
 
     @classmethod
-    def from_predopt(cls, m, capacity):
+    def from_predopt(cls, m, capacity, **kwargs):
         """
         Load knapsack problem instance from PredOpt benchmark dataset.
         Replicating data loading logic from
@@ -70,6 +70,7 @@ class KnapsackProblem(Problem):
             weights=data["weights"].astype(jnp.float32).reshape(1, -1),
             capacities=capacity * jnp.ones(1, dtype=jnp.float32),
             data_hash=data_hash,
+            **kwargs,
         )
 
     @classmethod
@@ -84,6 +85,8 @@ class KnapsackProblem(Problem):
         caps_per_dim=20,
         test_size=100,
         random_state=246,
+        use_cached=True,
+        **kwargs,
     ):
         """
         Generate a knapsack problem instance using pyepo's knapsack data generator.
@@ -105,10 +108,12 @@ class KnapsackProblem(Problem):
         print(f"Problem data hash: {problem_hash}")
 
         # Try to load cached problem data
-        cached_problem = load_cache(problem_hash, "problem_data")
-        if cached_problem is not None:
-            weights, x, c = cached_problem
+        if use_cached:
+            cached_problem = load_cache(problem_hash, "problem_data")
         else:
+            cached_problem = None
+
+        if cached_problem is None:
             print("Generating data...")
             weights, x, c = pyepo.data.knapsack.genData(
                 n + test_size,
@@ -131,4 +136,6 @@ class KnapsackProblem(Problem):
             weights=cached_problem["weights"],
             capacities=caps_per_dim * jnp.ones(dim),
             data_hash=problem_hash,
+            use_cached=use_cached,
+            **kwargs,
         )

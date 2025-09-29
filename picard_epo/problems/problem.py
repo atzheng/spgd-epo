@@ -16,10 +16,11 @@ class BatchData:
 
 
 class Problem(object):
-    def __init__(self, x, c, data_hash=None):
+    def __init__(self, x, c, data_hash=None, use_cached=True):
         self.data_hash = data_hash
         self.x = x
         self.c = c
+        self.use_cached = use_cached
 
     def batch_optimize(self, cost):
         raise NotImplementedError()
@@ -35,7 +36,11 @@ class Problem(object):
 
     @property
     def true_solutions(self) -> tuple[jnp.ndarray, jnp.ndarray]:
-        cached_solutions = load_cache(self.data_hash, "optimal_solutions")
+        cached_solutions = (
+            load_cache(self.data_hash, "optimal_solutions")
+            if self.use_cached
+            else None
+        )
         if cached_solutions is not None:
             return cached_solutions
         else:
