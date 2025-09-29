@@ -95,6 +95,8 @@ def create_train_epoch(optimizer, loss_fn, length, window_size, mesh):
         grads, losses = jax.vmap(picard_mapper, in_axes=(0, 0))(
             training_state, batch_data
         )
+        grads = jax.lax.psum(grads, axis_name="batch")
+        losses = jax.lax.pmean(losses, axis_name="batch")
         return grads, losses[:, None]
 
     def picard_iteration(state_and_data: Tuple[TrainingState, BatchData], _):
@@ -105,12 +107,9 @@ def create_train_epoch(optimizer, loss_fn, length, window_size, mesh):
                 shard_picard_mapper,
                 mesh=mesh,
                 in_specs=(P("picard"), P("picard", "batch")),
-                out_specs=(P("picard", "batch"), P("picard", "batch")),
+                out_specs=(P("picard"), P("picard")),
                 check_rep=False,
             )(training_state, window_batch)
-            # Should be sum not mean?
-            grads = jax.tree.map(lambda x: jnp.mean(x, axis=1), grads)
-            losses = jnp.mean(losses, axis=(1))
         else:
             grads, losses = jax.vmap(picard_mapper, in_axes=(0, 0))(
                 training_state, window_batch

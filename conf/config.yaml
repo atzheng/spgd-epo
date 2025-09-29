@@ -16,9 +16,9 @@ training:
   algo: sequential
   batches_per_eval: 128
   batches_per_epoch: null
-  mesh: null
-    # picard: 1
-    # batch: 1
+  mesh: 
+    picard: 1
+    batch: 1
   picard:
     window_size: 1
     restart_rule: best
