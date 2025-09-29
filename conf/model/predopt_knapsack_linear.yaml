@@ -1,3 +1,4 @@
-_target_: picard_epo.models.mlp.Linear
+_target_: picard_epo.models.mlp.BatchMLP
+hidden_sizes: []
 dim: 9
 
