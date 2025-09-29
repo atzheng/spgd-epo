@@ -75,7 +75,7 @@ def create_train_epoch(optimizer, loss_fn, length, window_size, mesh):
         loss, grads = jax.value_and_grad(loss_fn)(
             training_state.params, batch_data
         )
-        return grads
+        return grads, loss
 
     def picard_reducer(
         training_state: TrainingState, grad
@@ -92,20 +92,21 @@ def create_train_epoch(optimizer, loss_fn, length, window_size, mesh):
     def shard_picard_mapper(
         training_state: TrainingState, batch_data: BatchData
     ):
-        grads = jax.vmap(picard_mapper, in_axes=(0, 0))(
+        grads, losses = jax.vmap(picard_mapper, in_axes=(0, 0))(
             training_state, batch_data
         )
-        return grads
+        return grads, losses[:, None]
 
-    def picard_iteration(_, state_and_data: Tuple[TrainingState, BatchData]):
+    def picard_iteration(state_and_data: Tuple[TrainingState, BatchData], _):
         training_state, batch_data = state_and_data
-        grads = shard_map(
+        grads, losses = shard_map(
             shard_picard_mapper,
             mesh=mesh,
             in_specs=(P("picard"), P("picard", "batch")),
-            out_specs=P("picard", "batch"),
+            out_specs=(P("picard", "batch"), P("picard","batch")),
             check_rep=False,
         )(training_state, jax.tree.map(lambda x: x[:window_size], batch_data))
+        losses = jnp.mean(losses, axis=(1))
         grads = jax.tree.map(lambda x: jnp.mean(x, axis=1), grads)
         init_state = jax.tree.map(
             lambda x: x[0],
@@ -115,14 +116,14 @@ def create_train_epoch(optimizer, loss_fn, length, window_size, mesh):
         new_batch_data = jax.tree.map(
             lambda x: jnp.roll(x, 1, axis=0), batch_data
         )
-        return new_training_state, new_batch_data
+        return (new_training_state, new_batch_data), losses[0]
 
     def train_epoch(training_state: TrainingState, batch_data: BatchData):
         """Train on batch data using scan."""
-        final_state, final_batch = jax.lax.fori_loop(
-            0, length, picard_iteration, (training_state, batch_data)
+        (final_state, final_batch), losses = jax.lax.scan(
+            picard_iteration, (training_state, batch_data), length=length
         )
-        return final_state
+        return final_state, losses
 
     return train_epoch
 
@@ -188,8 +189,8 @@ def main(config: DictConfig) -> None:
 
     # Ensure train / test sizes is divisible by mesh
     mesh_batch = config.training.mesh.batch
-    train_idx = train_idx[: len(train_idx) // mesh_batch * mesh_batch]
-    test_idx = test_idx[: len(test_idx) // mesh_batch * mesh_batch]
+    train_idx = train_idx[: (len(train_idx) // mesh_batch) * mesh_batch]
+    test_idx = test_idx[: (len(test_idx) // mesh_batch) * mesh_batch]
     n_train = len(train_idx)
     n_test = len(test_idx)
 
@@ -283,8 +284,11 @@ def main(config: DictConfig) -> None:
             ts, gs = carry
 
             # Training
-            ts = train_epoch(ts, batches)
-            train_metrics = {}  # FIXME
+            ts, losses = train_epoch(ts, batches)
+            train_metrics = {
+                "train/loss": losses[-1],
+                "train/avg_loss": jnp.mean(losses[-1]),
+            }  
 
             # Validation
 
