@@ -381,7 +381,7 @@ def main(config: DictConfig) -> None:
             window_size = config.training.picard.window_size
             window_idx = jnp.arange(window_size)
             new_window_idx = jnp.where(
-                window_idx >= window_size - restart_t,
+                window_idx < window_size - restart_t,
                 jnp.roll(window_idx, -restart_t, axis=0),
                 fill_t,
             )
