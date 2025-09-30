@@ -214,7 +214,7 @@ def main(config: DictConfig) -> None:
     key = jax.random.PRNGKey(config.training.random_seed)
     params = model.init(key, dataset.x[0:1])
 
-    optimizer = optax.sgd(learning_rate=config.training.learning_rate)
+    optimizer = optax.adam(learning_rate=config.training.learning_rate)
     opt_state = optimizer.init(params)
 
     # Initialize training state
@@ -356,6 +356,9 @@ def main(config: DictConfig) -> None:
                 **{"val/first/" + k: v[0] for k, v in val_metrics.items()},
                 **{"val/best/" + k: v[best_t] for k, v in val_metrics.items()},
                 **{"val/last/" + k: v[-1] for k, v in val_metrics.items()},
+                **{
+                    "val/best_t": best_t,
+                }
             }
 
             if config.training.picard.restart_rule == "best":
@@ -378,6 +381,8 @@ def main(config: DictConfig) -> None:
                     f"Unknown fill rule {config.training.picard.fill_rule} (best, last are supported)."
                 )
 
+            new_gs = gs + config.training.batches_per_eval
+            restart_t = restart_t * (new_gs >= config.training.picard.warmup_steps)
             window_size = config.training.picard.window_size
             window_idx = jnp.arange(window_size)
             new_window_idx = jnp.where(
@@ -385,8 +390,8 @@ def main(config: DictConfig) -> None:
                 jnp.roll(window_idx, -restart_t, axis=0),
                 fill_t,
             )
+
             ts = jax.tree.map(lambda x: x[new_window_idx], ts)
-            new_gs = gs + config.training.batches_per_eval
             io_callback(log_metrics_callback, None, all_metrics, new_gs)
 
             return (ts, new_gs), all_metrics

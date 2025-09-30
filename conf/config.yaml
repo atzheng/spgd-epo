@@ -24,3 +24,4 @@ training:
     restart_rule: best
     restart_metric: train/loss
     fill_rule: last
+    warmup_steps: 0
