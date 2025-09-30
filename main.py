@@ -214,7 +214,7 @@ def main(config: DictConfig) -> None:
     key = jax.random.PRNGKey(config.training.random_seed)
     params = model.init(key, dataset.x[0:1])
 
-    optimizer = optax.adam(learning_rate=config.training.learning_rate)
+    optimizer = optax.sgd(learning_rate=config.training.learning_rate)
     opt_state = optimizer.init(params)
 
     # Initialize training state
@@ -253,11 +253,30 @@ def main(config: DictConfig) -> None:
     print(f"Starting training for {config.training.n_epochs} epochs...")
 
     batch_size = config.training.batch_size
-    num_batches = n_train // batch_size
-    eff_n_train = num_batches * batch_size
-    num_evals_per_epoch = max(
-        num_batches // config.training.batches_per_eval, 1
+
+    # How many batches to split the training data. May require multiple
+    # passes through training data if data is small.
+    num_batches = max(
+        # If training size is large enough, just use it
+        n_train // batch_size,
+        # Have to be able to create entire window, +batches_per_eval
+        config.training.picard.window_size + config.training.batches_per_eval,
     )
+
+    # Number of passes required through training data
+    eff_n_train = num_batches * batch_size
+    num_perms = int(np.ceil(eff_n_train / n_train))
+    num_evals_per_epoch = max(
+        (num_batches - config.training.picard.window_size)
+        // config.training.batches_per_eval,
+        1,
+    )
+
+    print(f"""
+    Splitting {n_train} samples into {num_batches} batches of size {batch_size}
+    (requires {num_perms} passes through training data).
+    """)
+    
 
     assert (
         num_batches >= config.training.picard.window_size
@@ -278,7 +297,12 @@ def main(config: DictConfig) -> None:
         training_state, global_step = carry
 
         # Shuffle training data
-        perm = jax.random.permutation(jax.random.PRNGKey(epoch_idx), n_train)
+        rng = jax.random.fold_in(
+            jax.random.PRNGKey(config.training.random_seed), epoch_idx
+        )
+        perm = jax.vmap(jax.random.permutation, in_axes=(0, None))(
+            jax.random.split(rng, num_perms), n_train
+        ).reshape(-1)
         shuffled_train_data = jax.tree.map(lambda x: x[perm], train_data)
         batches = jax.tree.map(
             lambda x: x[:eff_n_train].reshape((num_batches, batch_size, -1)),
@@ -322,7 +346,9 @@ def main(config: DictConfig) -> None:
                     ts.params, train_data, test_data
                 )
 
-            best_t = jnp.argmin(val_metrics["val/subopt"])
+            best_t = jnp.argmin(
+                val_metrics[config.training.picard.restart_metric]
+            )
 
             # Log all metrics
             all_metrics = {

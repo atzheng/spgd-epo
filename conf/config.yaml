@@ -22,4 +22,5 @@ training:
   picard:
     window_size: 1
     restart_rule: best
+    restart_metric: train/loss
     fill_rule: last
